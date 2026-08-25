@@ -79,6 +79,13 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    disable_mtp_loss: bool = False
+    """Disable the MTP training forward and loss while retaining the MTP module.
+
+    The retained module preserves checkpoint topology and remains available for
+    inference, but its parameters are frozen and omitted from the optimizer.
+    """
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 

@@ -241,6 +241,9 @@ class GPTModel(LanguageModule):
                 pg_collection=self.pg_collection,
             )
 
+            if self.config.disable_mtp_loss:
+                self.mtp.requires_grad_(False)
+
             self._setup_mtp_cuda_graphs()
 
         # Output
@@ -663,7 +666,11 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
+        if (
+            mtp_in_postprocess
+            and not self.config.disable_mtp_loss
+            and not (in_inference_mode or is_spec_decode)
+        ):
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -696,7 +703,7 @@ class GPTModel(LanguageModule):
                     )
                 else:
                     inference_context.mtp_decoder_hidden_states = hidden_states
-            elif not in_inference_mode:
+            elif not in_inference_mode and not self.config.disable_mtp_loss:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,

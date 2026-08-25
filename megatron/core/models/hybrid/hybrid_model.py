@@ -303,6 +303,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 hybrid_submodules=hybrid_submodules,
                 name="mtp",
             )
+            if self.config.disable_mtp_loss:
+                self.mtp.requires_grad_(False)
             self._setup_mtp_cuda_graphs()
 
         # Output
@@ -535,7 +537,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and inference_context.num_speculative_tokens > 0
         )
 
-        mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
+        mtp_forward_ran = (
+            self.mtp_process
+            and not self.config.disable_mtp_loss
+            and not (in_inference_mode or is_spec_decode)
+        )
         if mtp_forward_ran:
             hidden_states = self.mtp(
                 input_ids=input_ids,
@@ -567,7 +573,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     # Non-block scope: direct assignment; the controller will set
                     # this back to None after reading to allow GC.
                     inference_context.mtp_decoder_hidden_states = hidden_states
-            elif not in_inference_mode:
+            elif not in_inference_mode and not self.config.disable_mtp_loss:
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
                 hidden_states = process_mtp_loss(
