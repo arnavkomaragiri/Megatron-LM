@@ -16,14 +16,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
-from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
+from megatron.core.inference.contexts import (
+    BaseInferenceContext,
+    DynamicInferenceContext,
+)
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_get_slice_after,
     tensor_masked_update,
     tensor_merge,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, TreePackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.intermediate_extraction import (
@@ -115,7 +118,7 @@ class ExtendedRMSNorm(RMSNormGated):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias not sharded"""
-        if not hasattr(self, 'tp_group'):
+        if not hasattr(self, "tp_group"):
             self.tp_group = parallel_state.get_tensor_model_parallel_group()
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
@@ -508,7 +511,10 @@ class MambaMixer(MegatronModule):
             y = self._ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
         else:
             assert ssm_state is None
-            y = self._ssm_training(zxBCdt, packed_seq_params)
+            if isinstance(packed_seq_params, TreePackedSeqParams):
+                y = self._ssm_tree_training(zxBCdt, packed_seq_params)
+            else:
+                y = self._ssm_training(zxBCdt, packed_seq_params)
 
         out, out_bias = self.out_proj(y)
 
@@ -698,9 +704,9 @@ class MambaMixer(MegatronModule):
         is_dynamic_batching = batch_indices is not None
 
         if not is_dynamic_batching:
-            assert (
-                hidden_states.shape[0] == 1
-            ), "Only support decoding with 1 token at a time for now"
+            assert hidden_states.shape[0] == 1, (
+                "Only support decoding with 1 token at a time for now"
+            )
 
         # (1, b, d_model) -> (1, b, proj_dim)
         zxBCdt, _ = self.in_proj(hidden_states)
@@ -779,6 +785,102 @@ class MambaMixer(MegatronModule):
             y = self.norm(y)
 
         return y
+
+    def _ssm_tree_training(
+        self, zxBCdt: torch.Tensor, packed_seq_params: TreePackedSeqParams
+    ) -> torch.Tensor:
+        """Run convolution and selective scan once per physical tree segment."""
+        if causal_conv1d_fn is None:
+            raise RuntimeError("tree Mamba training requires causal-conv1d")
+        if not self.rmsnorm:
+            raise NotImplementedError("tree Mamba training requires gated RMSNorm")
+
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+        if zxBCdt.shape[0] != 1:
+            raise ValueError("tree Mamba training expects a packed batch dimension of one")
+        A = -torch.exp(self.cp.get_A_log().float())
+        z, xBC, dt = torch.split(
+            zxBCdt,
+            [
+                self.cp.d_inner_local_tpcp,
+                self.cp.d_inner_local_tpcp + 2 * self.cp.ngroups_local_tpcp * self.d_state,
+                self.cp.nheads_local_tpcp,
+            ],
+            dim=-1,
+        )
+        conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
+        conv_bias = self.cp.get_conv1d_bias()
+        D = (
+            rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+            if self.D_has_hdim
+            else self.cp.get_D()
+        )
+        state_dtype_kwarg = (
+            {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
+        )
+
+        final_conv_states = []
+        final_ssm_states = []
+        segment_outputs = []
+        conv_history = self.d_conv - 1
+        zero_conv_state = xBC.new_zeros(1, conv_history, xBC.shape[-1])
+        for segment_index, (start, length, parent) in enumerate(
+            zip(
+                packed_seq_params.tree_segment_starts,
+                packed_seq_params.tree_segment_lengths,
+                packed_seq_params.tree_segment_parents,
+            )
+        ):
+            segment_xBC = xBC[:, start : start + length]
+            initial_conv_state = zero_conv_state if parent == -1 else final_conv_states[parent]
+            conv_input = torch.cat([initial_conv_state, segment_xBC], dim=1)
+            conv_output = causal_conv1d_fn(
+                x=rearrange(conv_input, "b l d -> b d l").contiguous(),
+                weight=conv_weight,
+                bias=conv_bias,
+                activation=self.activation,
+            )
+            conv_output = rearrange(conv_output[..., -length:], "b d l -> b l d").contiguous()
+            final_conv_states.append(
+                conv_input[:, -conv_history:] if conv_history else conv_input[:, :0]
+            )
+
+            x_segment, B_segment, C_segment = torch.split(
+                conv_output,
+                [
+                    self.cp.d_inner_local_tpcp,
+                    self.cp.ngroups_local_tpcp * self.d_state,
+                    self.cp.ngroups_local_tpcp * self.d_state,
+                ],
+                dim=-1,
+            )
+            x_segment = rearrange(x_segment, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+            B_segment = rearrange(B_segment, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+            C_segment = rearrange(C_segment, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+            initial_ssm_state = None if parent == -1 else final_ssm_states[parent]
+            y_segment, final_ssm_state = mamba_chunk_scan_combined(
+                x_segment,
+                dt[:, start : start + length].contiguous(),
+                A,
+                B_segment,
+                C_segment,
+                self.chunk_size,
+                D=D,
+                z=None,
+                dt_bias=self.cp.get_dt_bias().float(),
+                dt_softplus=True,
+                return_final_states=True,
+                initial_states=initial_ssm_state,
+                **state_dtype_kwarg,
+            )
+            segment_outputs.append(y_segment)
+            final_ssm_states.append(final_ssm_state)
+
+        y = rearrange(torch.cat(segment_outputs, dim=1), "b l h p -> l b (h p)").contiguous()
+        z = rearrange(z, "b l (h p) -> l b (h p)", p=self.headdim).contiguous()
+        y = self.cp.post_conv_ssm(y, packed_seq_params)
+        z = self.cp.post_conv_ssm(z, packed_seq_params)
+        return self.norm(y, z)
 
     def _ssm_prefill(
         self,
@@ -886,7 +988,9 @@ class MambaMixer(MegatronModule):
             conv_bias = self.cp.get_conv1d_bias().to(conv_state_dtype)
 
             xBC_pre_conv = xBC if intermediate_conv_out is not None else None
-            from megatron.core.ssm.ops.causal_conv1d_varlen import causal_conv1d_varlen_fn
+            from megatron.core.ssm.ops.causal_conv1d_varlen import (
+                causal_conv1d_varlen_fn,
+            )
 
             xBC_out = causal_conv1d_varlen_fn(
                 x=xBC.squeeze(0).contiguous(),
@@ -944,9 +1048,9 @@ class MambaMixer(MegatronModule):
         # In this case, if `cp_size > 1` then that norm could be performed on less heads than if
         # `cp_size == 1` (groups of heads can be sharded across CP ranks), which would be
         # mathematically incorrect, and potentially arithmetically unstable.
-        assert (
-            self.cp.cp_size == 1 or self.rmsnorm
-        ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
+        assert self.cp.cp_size == 1 or self.rmsnorm, (
+            "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
+        )
 
         if is_dynamic_batching:
             # Unified varlen SSM path: all prefill requests through single kernel call
@@ -1399,7 +1503,7 @@ class MambaMixer(MegatronModule):
             if gathered.shape[0] != in_proj_dim:
                 gathered = gathered[:in_proj_dim].contiguous()
             # Gathered weight is replicated across full dp_cp; replica_id needs only the DP slot.
-            dp_cp_rank = torch.distributed.get_rank(metadata['dp_cp_group'])
+            dp_cp_rank = torch.distributed.get_rank(metadata["dp_cp_group"])
             sharded_state_dict[f"{prefix}in_proj.weight"] = make_tp_sharded_tensor_for_checkpoint(
                 gathered,
                 f"{prefix}in_proj.weight",
@@ -1407,7 +1511,7 @@ class MambaMixer(MegatronModule):
                 replica_id=(0, 0, dp_cp_rank),
                 prepend_offsets=sharded_offsets,
                 tp_group=self.tp_group,
-                dp_cp_group=metadata['dp_cp_group'],
+                dp_cp_group=metadata["dp_cp_group"],
             )
 
         assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (

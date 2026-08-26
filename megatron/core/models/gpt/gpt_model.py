@@ -15,13 +15,15 @@ from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
-from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.common.embeddings.language_model_embedding import (
+    LanguageModelEmbedding,
+)
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
     RotaryEmbedding,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, TreePackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -103,8 +105,8 @@ class GPTModel(LanguageModule):
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         position_embedding_type: Literal[
-            'learned_absolute', 'rope', 'mrope', 'yarn', 'none'
-        ] = 'learned_absolute',
+            "learned_absolute", "rope", "mrope", "yarn", "none"
+        ] = "learned_absolute",
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         rope_scaling: bool = False,
@@ -138,7 +140,7 @@ class GPTModel(LanguageModule):
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
 
-        if hasattr(self.config, 'position_embedding_type'):
+        if hasattr(self.config, "position_embedding_type"):
             self.position_embedding_type = self.config.position_embedding_type
         else:
             self.position_embedding_type = position_embedding_type
@@ -151,7 +153,7 @@ class GPTModel(LanguageModule):
         self.max_position_embeddings = max_sequence_length
         self.rotary_percent = rotary_percent
 
-        if hasattr(self.config, 'rotary_base'):
+        if hasattr(self.config, "rotary_base"):
             self.rotary_base = self.config.rotary_base
         else:
             self.rotary_base = rotary_base
@@ -174,7 +176,7 @@ class GPTModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+        if self.position_embedding_type == "rope" and not self.config.multi_latent_attention:
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
@@ -187,7 +189,7 @@ class GPTModel(LanguageModule):
                 cp_group=self.pg_collection.cp,
             )
 
-        elif self.position_embedding_type == 'yarn':
+        elif self.position_embedding_type == "yarn":
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
@@ -207,7 +209,7 @@ class GPTModel(LanguageModule):
                 ),
                 use_cpu_initialization=self.config.use_cpu_initialization,
             )
-        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
+        elif self.position_embedding_type == "mrope" and not self.config.multi_latent_attention:
             self.rotary_pos_emb = MultimodalRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
@@ -216,9 +218,9 @@ class GPTModel(LanguageModule):
                 rotary_base=rotary_base,
             )
             self.mrope_section = self.config.mrope_section
-            assert (
-                self.mrope_section is not None
-            ), "mrope require mrope_section setting, but we got None from TransformerConfig"
+            assert self.mrope_section is not None, (
+                "mrope require mrope_section setting, but we got None from TransformerConfig"
+            )
 
         # Cache for RoPE tensors which do not change between iterations.
         self.rotary_pos_emb_cache = {}
@@ -248,7 +250,6 @@ class GPTModel(LanguageModule):
 
         # Output
         if self.post_process:
-
             if self.config.defer_embedding_wgrad_compute:
                 # The embedding activation buffer preserves a reference to the input activations
                 # of the final embedding projection layer GEMM. It will hold the activations for
@@ -293,10 +294,10 @@ class GPTModel(LanguageModule):
 
         if has_config_logger_enabled(self.config):
             log_config_to_disk(
-                self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'
+                self.config, self.state_dict(), prefix=f"{type(self).__name__}_init_ckpt"
             )
         for name, module in self.named_modules():
-            if hasattr(module, 'finish_init'):
+            if hasattr(module, "finish_init"):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
@@ -313,7 +314,7 @@ class GPTModel(LanguageModule):
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
 
-        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
+        assert len(input_tensor) == 1, "input_tensor should only be length 1 for gpt/bert"
         self.decoder.set_input_tensor(input_tensor[0])
 
     def _preprocess(
@@ -372,9 +373,9 @@ class GPTModel(LanguageModule):
         # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
         rotary_pos_cos_sin = None
 
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+        if self.position_embedding_type == "rope" and not self.config.multi_latent_attention:
             use_flash_infer_fused_rope = (
-                hasattr(inference_context, 'use_flashinfer_fused_rope')
+                hasattr(inference_context, "use_flashinfer_fused_rope")
                 and inference_context.use_flashinfer_fused_rope
             )
             if (
@@ -382,9 +383,7 @@ class GPTModel(LanguageModule):
                 and inference_context is not None
                 and (self.config.flash_decode or use_flash_infer_fused_rope)
             ):
-                assert (
-                    not self.config.flash_decode
-                ) or inference_context.is_static_batching(), (
+                assert (not self.config.flash_decode) or inference_context.is_static_batching(), (
                     "Flash decode is only applicable to static batching."
                 )
                 # Flash decoding uses precomputed cos and sin for RoPE
@@ -409,10 +408,10 @@ class GPTModel(LanguageModule):
                 rotary_pos_emb = self.rotary_pos_emb(
                     rotary_seq_len,
                     packed_seq=packed_seq_params is not None
-                    and packed_seq_params.qkv_format == 'thd',
+                    and packed_seq_params.qkv_format == "thd",
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
-        elif self.position_embedding_type == 'yarn':
+        elif self.position_embedding_type == "yarn":
             if not InferenceMode.is_active() or not self.config.flash_decode:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
@@ -420,7 +419,7 @@ class GPTModel(LanguageModule):
                 rotary_pos_emb, _ = self.rotary_pos_emb(
                     rotary_seq_len,
                     packed_seq=packed_seq_params is not None
-                    and packed_seq_params.qkv_format == 'thd',
+                    and packed_seq_params.qkv_format == "thd",
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
             else:
@@ -428,7 +427,7 @@ class GPTModel(LanguageModule):
                     "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
                     "YarnRotaryEmbedding yet."
                 )
-        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
+        elif self.position_embedding_type == "mrope" and not self.config.multi_latent_attention:
             if not InferenceMode.is_active() or not self.config.flash_decode:
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
@@ -662,6 +661,14 @@ class GPTModel(LanguageModule):
             and inference_context.num_speculative_tokens > 0
         )
 
+        if (
+            isinstance(packed_seq_params, TreePackedSeqParams)
+            and mtp_in_postprocess
+            and not in_inference_mode
+            and not self.config.disable_mtp_loss
+        ):
+            raise NotImplementedError("tree packed sequences require disable_mtp_loss=True")
+
         # logits and loss
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -724,6 +731,10 @@ class GPTModel(LanguageModule):
         sequence_parallel_override = False
 
         if output_processor is not None:
+            if isinstance(packed_seq_params, TreePackedSeqParams):
+                raise NotImplementedError(
+                    "tree packed sequences do not support a custom output processor"
+                )
             return output_processor(
                 hidden_states=hidden_states,
                 output_layer=self.output_layer,
@@ -766,9 +777,20 @@ class GPTModel(LanguageModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        if isinstance(packed_seq_params, TreePackedSeqParams) and labels is not None:
+            raise NotImplementedError(
+                "tree packed sequences require externally prepared edge losses"
+            )
+        hidden_states, restore_tree_sequence_parallel = self._select_tree_edge_hidden_states(
+            hidden_states, packed_seq_params, self.output_layer
         )
+        try:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+        finally:
+            if restore_tree_sequence_parallel:
+                self.output_layer.sequence_parallel = True
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
@@ -785,14 +807,14 @@ class GPTModel(LanguageModule):
         if has_config_logger_enabled(self.config):
             payload = OrderedDict(
                 {
-                    'input_ids': input_ids,
-                    'position_ids': position_ids,
-                    'attention_mask': attention_mask,
-                    'decoder_input': decoder_input,
-                    'logits': logits,
+                    "input_ids": input_ids,
+                    "position_ids": position_ids,
+                    "attention_mask": attention_mask,
+                    "decoder_input": decoder_input,
+                    "logits": logits,
                 }
             )
-            log_config_to_disk(self.config, payload, prefix='input_and_logits')
+            log_config_to_disk(self.config, payload, prefix="input_and_logits")
 
         if labels is None:
             # [s b h] => [b s h]
@@ -878,7 +900,7 @@ class GPTModel(LanguageModule):
         )
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[Dict] = None
     ) -> ShardedStateDict:
         """Sharded state dict implementation for GPTModel backward-compatibility.
 
@@ -894,13 +916,13 @@ class GPTModel(LanguageModule):
             ShardedStateDict: sharded state dict for the GPTModel
         """
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        output_layer_extra_state_key = f'{prefix}output_layer._extra_state'
+        output_layer_extra_state_key = f"{prefix}output_layer._extra_state"
 
         # Old GPT checkpoints only stored the output layer weight key. So we remove the
         # _extra_state key but check that it doesn't contain any data anyway
         output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
-        assert not (
-            output_extra_state and output_extra_state.data
-        ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
+        assert not (output_extra_state and output_extra_state.data), (
+            f"Expected output layer extra state to be empty, got: {output_extra_state}"
+        )
 
         return sharded_state_dict

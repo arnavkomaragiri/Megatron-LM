@@ -19,7 +19,11 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    TreePackedSeqParams,
+    TreeQueryRun,
+)
 from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
@@ -32,7 +36,10 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    all_gather_last_dim_from_tensor_parallel_region,
+    gather_from_sequence_parallel_region,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
@@ -334,14 +341,14 @@ class Attention(MegatronModule, ABC):
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         else:
-            assert hasattr(
-                pg_collection, 'tp'
-            ), "Attention pg_collection must have tp process group"
-            assert hasattr(
-                pg_collection, 'cp'
-            ), "Attention pg_collection must have cp process group"
+            assert hasattr(pg_collection, "tp"), (
+                "Attention pg_collection must have tp process group"
+            )
+            assert hasattr(pg_collection, "cp"), (
+                "Attention pg_collection must have cp process group"
+            )
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
@@ -390,7 +397,7 @@ class Attention(MegatronModule, ABC):
         )
 
         self.checkpoint_core_attention = (
-            self.config.recompute_granularity == 'selective'
+            self.config.recompute_granularity == "selective"
             and "core_attn" in self.config.recompute_modules
         )
 
@@ -419,7 +426,7 @@ class Attention(MegatronModule, ABC):
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=False,
-            tp_comm_buffer_name='proj',
+            tp_comm_buffer_name="proj",
             tp_group=self.pg_collection.tp,
             name=(name + ".linear_proj") if name is not None else None,
         )
@@ -430,7 +437,7 @@ class Attention(MegatronModule, ABC):
             and (
                 (
                     self.config.fp8
-                    and self.config.fp8_recipe != 'delayed'
+                    and self.config.fp8_recipe != "delayed"
                     and is_te_min_version("2.6.0dev0")
                 )
                 or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
@@ -541,12 +548,14 @@ class Attention(MegatronModule, ABC):
         if self._pp_layer_offset is not None:
             return self._pp_layer_offset
 
-        assert (
-            self.config.virtual_pipeline_model_parallel_size is None
-        ), "Virtual pipeline parallelism is not supported for inference"
+        assert self.config.virtual_pipeline_model_parallel_size is None, (
+            "Virtual pipeline parallelism is not supported for inference"
+        )
 
         # Import here to avoid circular imports
-        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+        from megatron.core.transformer.transformer_layer import (
+            get_transformer_layer_offset,
+        )
 
         return get_transformer_layer_offset(
             self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
@@ -1005,14 +1014,14 @@ class Attention(MegatronModule, ABC):
         """
         pinned = self.flash_attention_version
         if pinned == 4:
-            assert (
-                HAVE_FA4
-            ), "flash_attention_version=4 requested but FlashAttention-4 is not installed"
+            assert HAVE_FA4, (
+                "flash_attention_version=4 requested but FlashAttention-4 is not installed"
+            )
             return True, False
         if pinned == 3:
-            assert (
-                HAVE_FA3
-            ), "flash_attention_version=3 requested but FlashAttention-3 is not installed"
+            assert HAVE_FA3, (
+                "flash_attention_version=3 requested but FlashAttention-3 is not installed"
+            )
             return False, True
         if pinned == 2:
             return False, False
@@ -1123,9 +1132,9 @@ class Attention(MegatronModule, ABC):
                     output_total = fa3_ret
                     softmax_lse = None
             else:
-                assert (
-                    self.batch_invariant_mode is False
-                ), "Batch invariant mode is not supported for flash attention 2"
+                assert self.batch_invariant_mode is False, (
+                    "Batch invariant mode is not supported for flash attention 2"
+                )
                 fa2_ret = flash_attn_varlen_func(
                     q,
                     k,
@@ -1253,9 +1262,9 @@ class Attention(MegatronModule, ABC):
                     if use_fa3:
                         kvcache_ret = flash_attn3_with_kvcache(**flash_attn_args)
                     else:
-                        assert (
-                            not self.batch_invariant_mode
-                        ), "Batch invariant mode is not supported for flash attention 2"
+                        assert not self.batch_invariant_mode, (
+                            "Batch invariant mode is not supported for flash attention 2"
+                        )
                         kvcache_ret = flash_attn_with_kvcache(**flash_attn_args)
                     if need_lse:
                         # FA2/FA3 *_with_kvcache return (out, softmax_lse) when
@@ -1274,6 +1283,101 @@ class Attention(MegatronModule, ABC):
             )
 
         return output_total
+
+    @staticmethod
+    def _tree_attention_key_indices(
+        packed_seq_params: TreePackedSeqParams, run: TreeQueryRun, device: torch.device
+    ) -> Tensor:
+        """Return the root-to-query-prefix physical indices for one query run."""
+        chain = []
+        segment_index = run.segment_index
+        while segment_index != -1:
+            chain.append(segment_index)
+            segment_index = packed_seq_params.tree_segment_parents[segment_index]
+        chain.reverse()
+
+        pieces = []
+        for segment_index in chain:
+            start = packed_seq_params.tree_segment_starts[segment_index]
+            if segment_index == run.segment_index:
+                end = run.global_end
+            else:
+                end = start + packed_seq_params.tree_segment_lengths[segment_index]
+            pieces.append(torch.arange(start, end, dtype=torch.long, device=device))
+        return torch.cat(pieces)
+
+    def _tree_attention_forward(
+        self, query: Tensor, key: Tensor, value: Tensor, packed_seq_params: TreePackedSeqParams
+    ) -> Tensor:
+        """Run causal tree attention while gathering only CP-sharded K/V."""
+        if flash_attn_varlen_func is None:
+            raise RuntimeError("tree attention requires flash-attn varlen support")
+        if self.attention_type != "self":
+            raise NotImplementedError("tree attention only supports self attention")
+        if self.config.softmax_type != "vanilla":
+            raise NotImplementedError("tree attention currently supports vanilla softmax only")
+        if is_layer_window_attention(
+            self.config.window_size, self.config.window_attn_skip_freq, self.layer_number
+        ):
+            raise NotImplementedError("tree attention does not support sliding windows")
+
+        cp_size = get_pg_size(self.pg_collection.cp)
+        if cp_size > 1:
+            key_rank_order = gather_from_sequence_parallel_region(key, group=self.pg_collection.cp)
+            value_rank_order = gather_from_sequence_parallel_region(
+                value, group=self.pg_collection.cp
+            )
+            key = key_rank_order.index_select(0, packed_seq_params.tree_cp_gather_inverse)
+            value = value_rank_order.index_select(0, packed_seq_params.tree_cp_gather_inverse)
+
+        outputs = []
+        output_indices = []
+        dropout_p = self.config.attention_dropout if self.training else 0.0
+        softmax_scale = self.config.softmax_scale
+        for run in packed_seq_params.tree_query_runs:
+            key_indices = self._tree_attention_key_indices(packed_seq_params, run, query.device)
+            cu_q = torch.tensor(
+                [0, run.local_indices.numel()], dtype=torch.int32, device=query.device
+            )
+            cu_kv = torch.tensor([0, key_indices.numel()], dtype=torch.int32, device=query.device)
+
+            def run_attention(
+                q: Tensor,
+                k: Tensor,
+                v: Tensor,
+                local_indices: Tensor = run.local_indices,
+                selected_key_indices: Tensor = key_indices,
+                cu_query: Tensor = cu_q,
+                cu_key_value: Tensor = cu_kv,
+            ) -> Tensor:
+                # Bind run metadata now: checkpoint recomputes this closure
+                # after the loop has advanced to later tree segments.
+                q_run = q.index_select(0, local_indices)
+                k_run = k.index_select(0, selected_key_indices)
+                v_run = v.index_select(0, selected_key_indices)
+                return flash_attn_varlen_func(
+                    q_run,
+                    k_run,
+                    v_run,
+                    cu_query,
+                    cu_key_value,
+                    int(local_indices.numel()),
+                    int(selected_key_indices.numel()),
+                    dropout_p=dropout_p,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                )
+
+            if self.training and torch.is_grad_enabled():
+                run_output = tensor_parallel.checkpoint(run_attention, False, query, key, value)
+            else:
+                run_output = run_attention(query, key, value)
+            outputs.append(run_output)
+            output_indices.append(run.local_indices)
+
+        if not outputs:
+            return torch.zeros_like(query)
+        return torch.zeros_like(query).index_copy(0, torch.cat(output_indices), torch.cat(outputs))
 
     def forward(
         self,
@@ -1326,9 +1430,9 @@ class Attention(MegatronModule, ABC):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if inference_context and inference_context.is_dynamic_batching():
-            assert (
-                HAVE_FA4 or HAVE_FA3 or is_fa_min_version("2.7.3")
-            ), "flash attn verion v2.7.3 and above is required for dynamic batching."
+            assert HAVE_FA4 or HAVE_FA3 or is_fa_min_version("2.7.3"), (
+                "flash attn verion v2.7.3 and above is required for dynamic batching."
+            )
 
         # hidden_states: [sq, b, h]
         is_inference_mode = InferenceMode.is_active()
@@ -1378,9 +1482,9 @@ class Attention(MegatronModule, ABC):
         # Check if fused_single_qkv_rope is requested but either unavailable or not
         # supported for the current use case.
         if self.attention_type != "cross":
-            assert not (
-                self.config.fused_single_qkv_rope and split_qkv
-            ), "fused_single_qkv_rope requested but not available/supported for the config."
+            assert not (self.config.fused_single_qkv_rope and split_qkv), (
+                "fused_single_qkv_rope requested but not available/supported for the config."
+            )
 
         qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
         with qkv_linear_manager as hidden_states:
@@ -1402,9 +1506,9 @@ class Attention(MegatronModule, ABC):
                 query, key, value = qkv_output
             mixed_qkv = qkv_split_arg_list = None
         else:
-            assert (
-                not self.config.attention_output_gate
-            ), "attention_output_gate is not supported for unsplit mixed_qkv tensor."
+            assert not self.config.attention_output_gate, (
+                "attention_output_gate is not supported for unsplit mixed_qkv tensor."
+            )
             mixed_qkv, qkv_split_arg_list = qkv_output
         nvtx_range_pop(suffix="qkv")
 
@@ -1465,7 +1569,7 @@ class Attention(MegatronModule, ABC):
                 )
             )
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
@@ -1480,7 +1584,7 @@ class Attention(MegatronModule, ABC):
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
                 if packed_seq_params.cu_seqlens_q_padded is not None:
                     cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
                 else:
@@ -1493,35 +1597,54 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
 
             if split_qkv:
-                if q_pos_emb is not None:
-                    # TODO VIJAY: simplify
-                    if inference_context is None or inference_context.is_static_batching():
+                if isinstance(packed_seq_params, TreePackedSeqParams):
+                    position_ids = packed_seq_params.tree_local_position_ids
+                    if q_pos_emb is not None:
                         query = apply_rotary_pos_emb(
-                            query,
-                            q_pos_emb,
+                            query.unsqueeze(1),
+                            q_pos_emb.index_select(0, position_ids),
                             config=self.config,
-                            cu_seqlens=cu_seqlens_q,
+                            mscale=self._yarn_concentration_factor,
+                            cp_group=self.pg_collection.cp,
+                        ).squeeze(1)
+                    if k_pos_emb is not None:
+                        key = apply_rotary_pos_emb(
+                            key.unsqueeze(1),
+                            k_pos_emb.index_select(0, position_ids),
+                            config=self.config,
+                            mscale=self._yarn_concentration_factor,
+                            cp_group=self.pg_collection.cp,
+                        ).squeeze(1)
+                else:
+                    if q_pos_emb is not None:
+                        # TODO VIJAY: simplify
+                        if inference_context is None or inference_context.is_static_batching():
+                            query = apply_rotary_pos_emb(
+                                query,
+                                q_pos_emb,
+                                config=self.config,
+                                cu_seqlens=cu_seqlens_q,
+                                mscale=self._yarn_concentration_factor,
+                                cp_group=self.pg_collection.cp,
+                            )
+                        else:
+                            query = inference_context.apply_rotary_emb_query(
+                                query,
+                                q_pos_emb,
+                                self.config,
+                                cu_seqlens_q,
+                                self.pg_collection.cp,
+                                mscale=self._yarn_concentration_factor,
+                            )
+                    if k_pos_emb is not None:
+                        key = apply_rotary_pos_emb(
+                            key,
+                            k_pos_emb,
+                            config=self.config,
+                            cu_seqlens=cu_seqlens_kv,
                             mscale=self._yarn_concentration_factor,
                             cp_group=self.pg_collection.cp,
                         )
-                    else:
-                        query = inference_context.apply_rotary_emb_query(
-                            query,
-                            q_pos_emb,
-                            self.config,
-                            cu_seqlens_q,
-                            self.pg_collection.cp,
-                            mscale=self._yarn_concentration_factor,
-                        )
-                if k_pos_emb is not None:
-                    key = apply_rotary_pos_emb(
-                        key,
-                        k_pos_emb,
-                        config=self.config,
-                        cu_seqlens=cu_seqlens_kv,
-                        mscale=self._yarn_concentration_factor,
-                        cp_group=self.pg_collection.cp,
-                    )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
                     mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
@@ -1541,7 +1664,17 @@ class Attention(MegatronModule, ABC):
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )
-        if self.checkpoint_core_attention and self.training:
+        if isinstance(packed_seq_params, TreePackedSeqParams):
+            if inference_context is not None:
+                raise NotImplementedError("tree attention is training-only")
+            if attention_bias is not None:
+                raise NotImplementedError("tree attention does not support attention bias")
+            if self.offload_core_attention:
+                raise NotImplementedError(
+                    "tree attention does not support fine-grained core-attention offload"
+                )
+            core_attn_out = self._tree_attention_forward(query, key, value, packed_seq_params)
+        elif self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,
@@ -1584,7 +1717,7 @@ class Attention(MegatronModule, ABC):
                     inference_context.is_decode_only(),
                     softmax_offset=self._get_inference_softmax_offset(),
                 )
-                core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+                core_attn_out = rearrange(core_attn_out, "s b h d -> s b (h d)")
 
                 # Clear the outputs for padding tokens when using quantization scales
                 # to avoid corrupting amax calculations
@@ -1594,7 +1727,7 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_manager.group_offload(
                 core_attn_out, forced_released_tensors=[query, key, value]
             )
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)
@@ -1687,7 +1820,7 @@ class SelfAttention(Attention):
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
             skip_bias_add=False,
             is_expert=False,
-            tp_comm_buffer_name='qkv',
+            tp_comm_buffer_name="qkv",
             tp_group=self.pg_collection.tp,
             name=(name + ".linear_qkv") if name is not None else None,
         )
@@ -1973,8 +2106,10 @@ class SelfAttention(Attention):
 
         assert self.core_attention.current_max_attn_logits.shape == (
             self.num_attention_heads_per_partition,
-        ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition}, ) \
+        ), (
+            f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition}, ) \
                     but {self.core_attention.current_max_attn_logits.shape}"
+        )
 
         grouped_max_attn_logits = torch.max(
             self.core_attention.current_max_attn_logits.view(
@@ -1989,17 +2124,17 @@ class SelfAttention(Attention):
             # Use num_query_groups_per_partition for tensor parallel scenarios
 
             # qk_clip_balancing_eta (g, 1, 1)
-            assert grouped_max_attn_logits.shape == (
-                self.num_query_groups_per_partition,
-            ), f"current_max_attn_logits shape is not ({self.num_query_groups_per_partition},) \
+            assert grouped_max_attn_logits.shape == (self.num_query_groups_per_partition,), (
+                f"current_max_attn_logits shape is not ({self.num_query_groups_per_partition},) \
                 but {grouped_max_attn_logits.shape}"
+            )
             self.qk_clip_balancing_eta = torch.clamp(
                 self.config.qk_clip_threshold / grouped_max_attn_logits, max=1.0
             ).view(self.num_query_groups_per_partition, 1, 1)
             assert torch.all(self.qk_clip_balancing_eta <= 1.0)
 
             # Handle different weight access patterns (main_param vs direct access)
-            if hasattr(self.linear_qkv.weight, 'main_param'):
+            if hasattr(self.linear_qkv.weight, "main_param"):
                 self.linear_qkv.weight.main_param.data.copy_(
                     self._clip_linear_qkv(self.linear_qkv.weight.main_param.data)
                 )
@@ -2026,8 +2161,7 @@ class SelfAttention(Attention):
         ]
         weight_k = weight_reshaped[
             :,
-            self.query_projection_size
-            // self.num_query_groups_per_partition : (
+            self.query_projection_size // self.num_query_groups_per_partition : (
                 self.query_projection_size + self.kv_projection_size
             )
             // self.num_query_groups_per_partition,

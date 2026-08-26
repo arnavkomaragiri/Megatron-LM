@@ -9,11 +9,15 @@ from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.common.embeddings.language_model_embedding import (
+    LanguageModelEmbedding,
+)
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
-from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import (
+    YarnRotaryEmbedding,
+)
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, TreePackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -41,15 +45,15 @@ logger = logging.getLogger(__name__)
 
 
 def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
-    tp_group = getattr(pg_collection, 'tp', None)
-    dp_cp_group = getattr(pg_collection, 'dp_cp', None)
+    tp_group = getattr(pg_collection, "tp", None)
+    dp_cp_group = getattr(pg_collection, "dp_cp", None)
     if (tp_group is None) != (dp_cp_group is None):
         raise ValueError(
             "pg_collection.tp and pg_collection.dp_cp must both be set or both be unset."
         )
     if tp_group is None:
         return {}
-    return {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
+    return {"tp_group": tp_group, "dp_cp_group": dp_cp_group}
 
 
 class HybridModel(LanguageModule, GraphableMegatronModule):
@@ -116,7 +120,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         # Mamba with no attention has no need for position embeddings, so none is default
-        position_embedding_type: Literal['learned_absolute', 'rope', 'yarn', 'none'] = 'none',
+        position_embedding_type: Literal["learned_absolute", "rope", "yarn", "none"] = "none",
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         scatter_embedding_sequence_parallel: bool = True,
@@ -181,7 +185,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "Use hybrid_layer_pattern instead.",
             )
             if self.hybrid_layer_pattern is None:
-                from megatron.core.models.hybrid.hybrid_layer_allocation import pattern_from_ratios
+                from megatron.core.models.hybrid.hybrid_layer_allocation import (
+                    pattern_from_ratios,
+                )
 
                 attn_ratio = hybrid_attention_ratio if hybrid_attention_ratio else 0.0
                 mlp_ratio = hybrid_mlp_ratio if hybrid_mlp_ratio else 0.0
@@ -203,7 +209,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
 
         layer_type_list, layer_offset = select_pipeline_segment(
-            parsed.main_pattern or '',
+            parsed.main_pattern or "",
             self.pg_collection.pp,
             vp_stage,
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
@@ -243,7 +249,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # MLA (also used by DeepSeek Sparse Attention) uses its own decoupled RoPE, therefore we do
         # not build standard RoPE here when using MLA.
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+        if self.position_embedding_type == "rope" and not self.config.multi_latent_attention:
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
@@ -252,7 +258,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
-        elif self.position_embedding_type == 'yarn':
+        elif self.position_embedding_type == "yarn":
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
@@ -330,7 +336,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.setup_embeddings_and_output_layer()
 
         for name, module in self.named_modules():
-            if hasattr(module, 'finish_init'):
+            if hasattr(module, "finish_init"):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
@@ -347,7 +353,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
 
-        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
+        assert len(input_tensor) == 1, "input_tensor should only be length 1 for gpt/bert"
         self.decoder.set_input_tensor(input_tensor[0])
 
     def preprocess_for_fine_grained_offloading(self):
@@ -384,17 +390,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         """
         if (
             InferenceMode.is_active()
-            and hasattr(self, 'cudagraph_manager')
+            and hasattr(self, "cudagraph_manager")
             and (
-                kwargs.get('inference_context') is not None
-                or kwargs.get('inference_params') is not None
+                kwargs.get("inference_context") is not None
+                or kwargs.get("inference_params") is not None
             )
             and self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         ):
-            if kwargs['inference_context'].is_static_batching():
-                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            if kwargs["inference_context"].is_static_batching():
+                using_cuda_graph = kwargs["inference_context"].is_decode_only()
             else:
-                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+                using_cuda_graph = kwargs["inference_context"].using_cuda_graph_this_step()
 
             if using_cuda_graph:
                 return True
@@ -479,22 +485,22 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             decoder_input = None
 
         rotary_pos_emb = None
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+        if self.position_embedding_type == "rope" and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
             rotary_pos_emb = self.rotary_pos_emb(
                 rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == "thd",
             )
-        elif self.position_embedding_type == 'yarn':
+        elif self.position_embedding_type == "yarn":
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
             # YarnRotaryEmbedding.forward returns (emb, mscale); discard mscale here
             rotary_pos_emb, _ = self.rotary_pos_emb(
                 rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == "thd",
             )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
@@ -536,6 +542,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and inference_context.is_dynamic_batching()
             and inference_context.num_speculative_tokens > 0
         )
+
+        if (
+            isinstance(packed_seq_params, TreePackedSeqParams)
+            and self.mtp_process
+            and not in_inference_mode
+            and not self.config.disable_mtp_loss
+        ):
+            raise NotImplementedError("tree packed sequences require disable_mtp_loss=True")
 
         mtp_forward_ran = (
             self.mtp_process
@@ -616,9 +630,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        if isinstance(packed_seq_params, TreePackedSeqParams) and labels is not None:
+            raise NotImplementedError(
+                "tree packed sequences require externally prepared edge losses"
+            )
+        hidden_states, restore_sequence_parallel = self._select_tree_edge_hidden_states(
+            hidden_states, packed_seq_params, self.output_layer
         )
+        try:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+        finally:
+            if restore_sequence_parallel:
+                self.output_layer.sequence_parallel = True
         logits = self._scale_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.

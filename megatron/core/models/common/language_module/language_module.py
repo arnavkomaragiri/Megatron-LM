@@ -15,6 +15,7 @@ try:
 except:
     te_parallel_cross_entropy = None
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+from megatron.core.packed_seq_params import TreePackedSeqParams
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -22,9 +23,14 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import (
+    reduce_from_tensor_model_parallel_region,
+)
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
+from megatron.core.transformer.multi_token_prediction import (
+    tie_word_embeddings_state_dict,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import (
@@ -53,7 +59,7 @@ class LanguageModule(MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_group = get_tensor_model_parallel_group_if_none(pg_collection.tp)
         self.pp_group = pg_collection.pp
-        assert hasattr(self.pg_collection, 'embd'), (
+        assert hasattr(self.pg_collection, "embd"), (
             "pg_collection must have a embd. In previous version, it used default "
             "`parallel_state.default_embedding_ranks` to create the process group."
             "If you are using the default process group, please use"
@@ -78,13 +84,62 @@ class LanguageModule(MegatronModule):
                 inline_capture=True,
             )
 
+    def _select_tree_edge_hidden_states(
+        self, hidden_states: Tensor, packed_seq_params, output_layer
+    ) -> tuple[Tensor, bool]:
+        """Select CP-owned sampled-edge states before vocabulary projection.
+
+        Sequence-parallel decoder outputs are split contiguously across TP.
+        Each TP rank inserts only the edge states it owns into a fixed edge
+        axis, then a TP reduction reconstructs that axis on every rank. The
+        output layer must temporarily disable its normal sequence gather
+        because the selected edge axis is already replicated.
+        """
+        if not isinstance(packed_seq_params, TreePackedSeqParams):
+            return hidden_states, False
+
+        edge_count = packed_seq_params.tree_edge_output_indices.numel()
+        if edge_count == 0:
+            hidden_states = hidden_states[:1] * 0.0
+        elif output_layer.sequence_parallel:
+            tp_size = self.tp_group.size()
+            tp_rank = self.tp_group.rank()
+            local_token_count = hidden_states.shape[0]
+            if local_token_count * tp_size != packed_seq_params.tree_cp_local_token_count:
+                raise ValueError(
+                    "tree edge projection expected contiguous TP sequence shards: "
+                    f"local={local_token_count}, tp={tp_size}, "
+                    f"cp_local={packed_seq_params.tree_cp_local_token_count}"
+                )
+            edge_cp_indices = packed_seq_params.tree_edge_local_indices[:edge_count]
+            shard_start = tp_rank * local_token_count
+            shard_end = shard_start + local_token_count
+            owned = (edge_cp_indices >= shard_start) & (edge_cp_indices < shard_end)
+            owned_edge_positions = owned.nonzero(as_tuple=False).flatten()
+            owned_hidden = hidden_states.index_select(0, edge_cp_indices[owned] - shard_start)
+            edge_hidden = hidden_states.new_zeros(edge_count, *hidden_states.shape[1:]).index_copy(
+                0, owned_edge_positions, owned_hidden
+            )
+            hidden_states = reduce_from_tensor_model_parallel_region(
+                edge_hidden, group=self.tp_group
+            )
+        else:
+            hidden_states = hidden_states.index_select(
+                0, packed_seq_params.tree_edge_local_indices[:edge_count]
+            )
+
+        restore_sequence_parallel = output_layer.sequence_parallel
+        if restore_sequence_parallel:
+            output_layer.sequence_parallel = False
+        return hidden_states, restore_sequence_parallel
+
     def _is_in_embd_group(self):
         if self.embd_group is None:
             return False
         if torch.distributed.get_rank() in torch.distributed.get_process_group_ranks(
             self.embd_group
         ):
-            if getattr(self, 'mtp_process', False):
+            if getattr(self, "mtp_process", False):
                 return True
             if (
                 torch.distributed.get_rank()
@@ -115,9 +170,9 @@ class LanguageModule(MegatronModule):
             env_variable_name: str, expected_value: int, attn_type: AttnBackend
         ) -> None:
             current_value = os.getenv(env_variable_name)
-            assert current_value is None or current_value == str(
-                expected_value
-            ), f'{env_variable_name} set to {current_value}, but expected {expected_value} for attention backend type {attn_type.name}. unset NVTE_FLASH_ATTN, NVTE_FUSED_ATTN and NVTE_UNFUSED_ATTN. Use the --attention-backend argument if you want to choose between (flash/fused/unfused/auto/local). Default is auto.'
+            assert current_value is None or current_value == str(expected_value), (
+                f"{env_variable_name} set to {current_value}, but expected {expected_value} for attention backend type {attn_type.name}. unset NVTE_FLASH_ATTN, NVTE_FUSED_ATTN and NVTE_UNFUSED_ATTN. Use the --attention-backend argument if you want to choose between (flash/fused/unfused/auto/local). Default is auto."
+            )
             os.environ[env_variable_name] = str(expected_value)
 
         if self.config.attention_backend == AttnBackend.local:
@@ -165,12 +220,12 @@ class LanguageModule(MegatronModule):
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
         if self.config.cross_entropy_loss_fusion:
-            if self.config.cross_entropy_fusion_impl == 'te':
+            if self.config.cross_entropy_fusion_impl == "te":
                 if te_parallel_cross_entropy is not None:
                     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
                     # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
                     is_cg_capturable = (
-                        hasattr(self.config, 'cuda_graph_impl')
+                        hasattr(self.config, "cuda_graph_impl")
                         and self.config.cuda_graph_impl == "full_iteration"
                     )
                     if is_cg_capturable and not is_te_min_version("2.7.0"):
@@ -188,7 +243,7 @@ class LanguageModule(MegatronModule):
                     )
                 else:
                     raise RuntimeError("Trying to use a TE block when it's not present.")
-            elif self.config.cross_entropy_fusion_impl == 'native':
+            elif self.config.cross_entropy_fusion_impl == "native":
                 loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(
@@ -220,11 +275,11 @@ class LanguageModule(MegatronModule):
         # LayerWise distributed optimizer routes it to its Muon-managed buffer and
         # `_emit_bucket(shared_embedding=True)` replicates the (vocab x hidden) tensor
         # across all dp_size shards, blowing up the chunk's buffer by ~8x.
-        if (self.pre_process or getattr(self, 'mtp_process', False)) and hasattr(self, 'embedding'):
+        if (self.pre_process or getattr(self, "mtp_process", False)) and hasattr(self, "embedding"):
             self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
         if (
             self.post_process
-            and hasattr(self, 'output_layer')
+            and hasattr(self, "output_layer")
             and self.output_layer.weight is not None
         ):
             self.output_layer.weight.is_embedding_or_output_parameter = True
@@ -232,14 +287,14 @@ class LanguageModule(MegatronModule):
         # Mark embedding-class parameters for MuP optimizer grouping.
         # Under MuP table-8-style grouping, embeddings/output use base LR/eps while
         # hidden matrix-like params use width-scaled LR/eps.
-        mtp_process = getattr(self, 'mtp_process', False)
-        if self.config.use_mup and (self.pre_process or mtp_process) and hasattr(self, 'embedding'):
+        mtp_process = getattr(self, "mtp_process", False)
+        if self.config.use_mup and (self.pre_process or mtp_process) and hasattr(self, "embedding"):
             for param in self.embedding.parameters():
                 param.is_embedding_parameter = True
         if (
             self.config.use_mup
             and self.post_process
-            and hasattr(self, 'output_layer')
+            and hasattr(self, "output_layer")
             and self.output_layer.weight is not None
         ):
             self.output_layer.weight.is_embedding_parameter = True
@@ -250,7 +305,7 @@ class LanguageModule(MegatronModule):
         # So we need to copy embedding weights from pre processing stage as initial parameters
         # in these cases.
         if not self.share_embeddings_and_output_weights and not getattr(
-            self.config, 'mtp_num_layers', 0
+            self.config, "mtp_num_layers", 0
         ):
             return
 
@@ -271,7 +326,7 @@ class LanguageModule(MegatronModule):
 
         if (
             (self.post_process and self.share_embeddings_and_output_weights)
-            or getattr(self, 'mtp_process', False)
+            or getattr(self, "mtp_process", False)
         ) and not self.pre_process:
             assert not (
                 is_vp_first_stage(self.vp_stage, self.vp_size) and is_pp_first_stage(self.pp_group)
@@ -343,14 +398,14 @@ class LanguageModule(MegatronModule):
         Returns:
             Tensor: During pre processing or MTP process it returns the input embeddings weight while during post processing it returns the final output layers weight
         """
-        if self.pre_process or getattr(self, 'mtp_process', False):
+        if self.pre_process or getattr(self, "mtp_process", False):
             # Multi-Token Prediction (MTP) need both embedding layer and output layer.
             # So there will be both embedding layer and output layer in the mtp process stage.
             # When share_embeddings_and_output_weights is True, the embedding weight is the
             # canonical shared weight and is passed to the output layer during forward.
-            assert hasattr(
-                self, 'embedding'
-            ), f"embedding is needed in this pipeline stage, but it is not initialized."
+            assert hasattr(self, "embedding"), (
+                f"embedding is needed in this pipeline stage, but it is not initialized."
+            )
             return self.embedding.word_embeddings.weight
         elif self.post_process:
             return self.output_layer.weight
@@ -407,7 +462,7 @@ class LanguageModule(MegatronModule):
 
     def sharded_state_dict(
         self,
-        prefix: str = '',
+        prefix: str = "",
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
@@ -428,9 +483,9 @@ class LanguageModule(MegatronModule):
 
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
-        first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
-        output_layer_weight_key = f'{prefix}output_layer.weight'
-        output_layer_bias_key = f'{prefix}output_layer.bias'
+        first_stage_word_emb_key = f"{prefix}embedding.word_embeddings.weight"
+        output_layer_weight_key = f"{prefix}output_layer.weight"
+        output_layer_bias_key = f"{prefix}output_layer.bias"
 
         # Multi-Token Prediction (MTP) needs embedding layer in mtp process stage.
         # If MTP is not placed in the pre processing stage, we need to maintain a copy of
@@ -438,14 +493,14 @@ class LanguageModule(MegatronModule):
         # processing stage.
         # Note: MTP loss is computed at post_process stage, so the output_layer on mtp_process
         # rank doesn't need special tying - it's not used for loss computation.
-        if getattr(self, 'mtp_process', False) and not self.pre_process:
+        if getattr(self, "mtp_process", False) and not self.pre_process:
             emb_weight = self.embedding.word_embeddings.weight
             tie_word_embeddings_state_dict(
                 sharded_state_dict,
                 emb_weight,
                 first_stage_word_emb_key,
                 tp_group=self.tp_group,
-                dp_cp_group=metadata['dp_cp_group'],
+                dp_cp_group=metadata["dp_cp_group"],
             )
         if self.share_embeddings_and_output_weights:
             self.tie_embeddings_and_output_weights_state_dict(
@@ -492,7 +547,7 @@ class LanguageModule(MegatronModule):
         # layer in mtp process stage. In this case, if share_embeddings_and_output_weights is True,
         # the shared weights will be stored in embedding layer, and output layer will not have
         # any weight.
-        if getattr(self, 'mtp_process', False):
+        if getattr(self, "mtp_process", False):
             # No output layer
             assert output_layer_weight_key not in sharded_state_dict, sharded_state_dict.keys()
             return
@@ -512,5 +567,5 @@ class LanguageModule(MegatronModule):
             replica_id=last_stage_word_emb_replica_id,
             allow_shape_mismatch=True,
             tp_group=self.tp_group,
-            dp_cp_group=metadata['dp_cp_group'],
+            dp_cp_group=metadata["dp_cp_group"],
         )
